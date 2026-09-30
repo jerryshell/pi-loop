@@ -1,17 +1,17 @@
 /**
- * pi-loop — Pi 无限自我迭代扩展
+ * pi-loop：Pi 无限自我迭代扩展
  *
  * 命令：
- *   /loop [目标]    激活死循环：每轮结束后自动开始下一轮，并持续注入迭代指令
- *   /loop-off       在下一个里程碑（当前轮自然结束）停止
- *   /loop-off-now   立即中止当前运行并停止
+ *   /loop [目标]    激活循环：空闲时立即开始下一轮，运行中则在本轮结束后接管
+ *   /loop-off       里程碑停止：当前轮自然结束后停止；空闲时立即停止
+ *   /loop-off-now   立即停止：中止当前运行并清除循环状态
  *
- * 除 /loop-off 与 /loop-off-now 外，没有任何理由会停止循环：
- *   - 模型自行结束、提问、请求确认  -> 注入下一轮
- *   - 模型请求出错                  -> 退避后继续（5s → 60s）
- *   - 用户中断（Esc）/ 运行异常结束 -> agent_settled 后自动重新点火
- *   - 看门狗每 15s 检查：激活但空闲就重新点火
- *   - 会话/进程重启后恢复会话       -> 自动继续迭代
+ * 设计契约（修改前先读 README 的「关键认知」）：
+ *   - 停止条件只有 /loop-off 与 /loop-off-now；模型自述、报错、中断都不算
+ *   - 四道点火机制：agent_before_settle、agent_settled、看门狗、session_start 恢复
+ *   - 迭代指令在上下文中只保留最新一条，循环关闭后全部移除
+ *   - 循环状态用 pi.appendEntry 写入会话；进程内变量只是缓存
+ *   - 仅依赖宿主提供包，保持单文件、无构建步骤
  *
  * 激活状态通过 ctx.ui.setStatus 显示在底部状态栏。
  */
@@ -71,12 +71,16 @@ export default function piLoop(pi: ExtensionAPI): void {
   let goal = DEFAULT_GOAL;
   let iteration = 0;
   let stallStreak = 0;
+  /** 本轮是否调用过工具：决定迭代是否真实 */
   let usedToolThisRound = false;
+  /** 本轮迭代指令是否已注入：决定是否评估停滞 */
   let tickInjected = false;
+  // 点火去重：三道点火机制可能同时命中，以下标志保证同一时刻只有一次点火
   /** 已结束运行但循环仍在激活：等待重新点火 */
   let restartArmed = false;
   let errorBackoffMs = 0;
   let restartDelayMs = 0;
+  /** 当前是否有运行在执行（乐观置位，避免看门狗重复点火） */
   let runActive = false;
   let disposed = false;
   let pendingRestart: ReturnType<typeof setTimeout> | undefined;
@@ -114,24 +118,24 @@ export default function piLoop(pi: ExtensionAPI): void {
 
   function buildTickContent(outcome: TickOutcome): string {
     const lines = [
-      `[PI-LOOP ACTIVE] 第 ${iteration} 轮自我迭代 —— 这是一个不会自行停止的外部循环。`,
+      `[PI-LOOP ACTIVE] 第 ${iteration} 轮自我迭代：这是一个不会自行停止的外部循环。`,
       "",
-      "1. 立即开始当前最高价值的下一步工作并直接动手；不要征求许可、不要只复述计划、不要以提问结束。",
+      "1. 立即开始当前最高价值的下一步工作并直接动手；不征求许可、不复述计划、不以提问结束。",
       "2. 本轮必须有真实产出（文件修改、命令执行、验证结果），纯文字回复不算迭代。",
-      "3. 完成后自行验证（测试、构建、运行），简短记录结果与新的发现，然后继续下一轮。",
+      "3. 完成后自行验证（测试、构建、运行），简短记录结果和新发现，然后继续下一轮。",
       "4. 当前目标完成后，主动寻找下一个更高价值的改进点继续推进。",
-      "5. 只有外部指令 /loop-off 或 /loop-off-now 才能结束循环；不要自行收尾，也不要询问是否继续。",
+      "5. 只有外部指令 /loop-off 或 /loop-off-now 才能结束循环；不自行收尾，也不询问是否继续。",
       "",
       `长期目标：${goal}`,
     ];
     if (stallStreak > 0) {
-      lines.push("", `⚠ 最近 ${stallStreak} 轮没有任何工具调用。本轮必须执行真实动作。`);
+      lines.push("", `⚠ 最近连续 ${stallStreak} 轮没有工具调用，本轮必须执行真实动作。`);
     }
     if (outcome === "error") {
       lines.push("", "⚠ 上一轮模型请求出错：先诊断原因并规避该错误，再继续推进目标。");
     }
     if (outcome === "interrupted") {
-      lines.push("", "⚠ 上一轮被外部中断（循环并未关闭）：从中断处继续，不要等待任何确认。");
+      lines.push("", "⚠ 上一轮被外部中断（循环并未关闭）：从中断处继续，不等待确认。");
     }
     return lines.join("\n");
   }
@@ -189,10 +193,10 @@ export default function piLoop(pi: ExtensionAPI): void {
     cancelRestart();
     updateStatus(ctx);
     persist();
-    ctx.ui.notify(`pi-loop 已停止（完成 ${iteration} 轮）— ${reason}`, "info");
+    ctx.ui.notify(`pi-loop 已停止（完成 ${iteration} 轮）：${reason}`, "info");
   }
 
-  // ---- 终端显示：把冗长的迭代指令折叠成一行 ------------------------------------
+  // [终端显示] 把冗长的迭代指令折叠成一行
 
   pi.registerMessageRenderer(TICK_TYPE, (message, { expanded, outputPad }, theme) => {
     const details = message.details as TickDetails | undefined;
@@ -209,7 +213,7 @@ export default function piLoop(pi: ExtensionAPI): void {
     return box;
   });
 
-  // ---- 命令 --------------------------------------------------------------------
+  // [命令]
 
   pi.registerCommand("loop", {
     description: "激活无限自我迭代循环（可带目标：/loop 目标描述）",
@@ -243,7 +247,7 @@ export default function piLoop(pi: ExtensionAPI): void {
         updateStatus(ctx);
         pi.sendMessage(tick, { triggerTurn: true });
         ctx.ui.notify(
-          `pi-loop 已激活（第 ${iteration} 轮）：${goal}\n停止：/loop-off（里程碑）· /loop-off-now（立即）`,
+          `pi-loop 已激活（第 ${iteration} 轮）：${goal}\n停止：/loop-off（里程碑）、/loop-off-now（立即）`,
           "info",
         );
       } else {
@@ -288,7 +292,7 @@ export default function piLoop(pi: ExtensionAPI): void {
     },
   });
 
-  // ---- 事件 --------------------------------------------------------------------
+  // [事件]
 
   pi.on("agent_start", async () => {
     runActive = true;
@@ -372,7 +376,7 @@ export default function piLoop(pi: ExtensionAPI): void {
 
     updateStatus(ctx);
     if (phase === "running") {
-      ctx.ui.notify(`pi-loop 已恢复（第 ${iteration} 轮）· /loop-off 停止`, "info");
+      ctx.ui.notify(`pi-loop 已恢复（第 ${iteration} 轮）；/loop-off 停止`, "info");
       // 延迟点火：避免抢占用户启动时刚提交的第一条消息
       fireRestart(ctx, undefined, SESSION_RESUME_DELAY_MS);
     }
