@@ -9,7 +9,7 @@
  * 设计契约（修改前先读 README 的「关键认知」）：
  *   - 停止条件只有 /loop-off 与 /loop-off-now；模型自述、报错、中断都不算
  *   - 四道点火机制：agent_before_settle、agent_settled、看门狗、session_start 恢复
- *   - 迭代指令在上下文中只保留最新一条，循环关闭后全部移除
+ *   - 上下文只追加、不改写历史（前缀缓存友好）；压缩后清理旧指令，循环关闭后全部移除
  *   - 循环状态用 pi.appendEntry 写入会话；进程内变量只是缓存
  *   - 仅依赖宿主提供包，保持单文件、无构建步骤
  *
@@ -82,6 +82,8 @@ export default function piLoop(pi: ExtensionAPI): void {
   let restartDelayMs = 0;
   /** 当前是否有运行在执行（乐观置位，避免看门狗重复点火） */
   let runActive = false;
+  /** 压缩会重写历史、前缀缓存必然失效：借压缩后的第一次请求清理旧迭代指令 */
+  let trimTicksAfterCompact = false;
   let disposed = false;
   let pendingRestart: ReturnType<typeof setTimeout> | undefined;
   let watchdog: ReturnType<typeof setInterval> | undefined;
@@ -179,6 +181,14 @@ export default function piLoop(pi: ExtensionAPI): void {
       if (disposed || phase !== "running") {
         restartArmed = false;
         if (!disposed) updateStatus(ctx);
+        return;
+      }
+      // 用户输入优先：退避期间用户已开始新运行或有排队消息时本轮不点火，
+      // 否则迭代指令会以 steer 插进用户的运行；用户运行结束时会在结算点自然续上
+      if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+        restartArmed = false;
+        runActive = !ctx.isIdle();
+        updateStatus(ctx);
         return;
       }
       const tick = beginRound(outcome, false);
@@ -305,11 +315,24 @@ export default function piLoop(pi: ExtensionAPI): void {
     usedToolThisRound = true;
   });
 
-  // 循环未激活时从上下文移除迭代指令；激活时只保留最新一条，避免上下文膨胀
+  pi.on("session_compact", async () => {
+    trimTicksAfterCompact = true;
+  });
+
+  // 上下文只追加、不改写历史：删除任意一条历史消息都会让其后缀的前缀缓存全部失效
   pi.on("context", async (event) => {
     const ticks = event.messages.filter(isTick);
     if (ticks.length === 0) return;
-    const keep = phase === "off" ? undefined : ticks[ticks.length - 1];
+
+    if (phase === "off") {
+      trimTicksAfterCompact = false;
+      return { messages: event.messages.filter((message) => !isTick(message)) };
+    }
+
+    // 压缩改写历史后缓存本就要重建，此时清理旧指令不产生额外代价
+    if (!trimTicksAfterCompact) return;
+    trimTicksAfterCompact = false;
+    const keep = ticks[ticks.length - 1];
     return { messages: event.messages.filter((message) => !isTick(message) || message === keep) };
   });
 
