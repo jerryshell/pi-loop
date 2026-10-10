@@ -73,6 +73,14 @@ export default function piLoop(pi: ExtensionAPI): void {
   let stallStreak = 0;
   /** 本轮是否调用过工具：决定迭代是否真实 */
   let usedToolThisRound = false;
+  /** 本轮顶层工具调用次数（嵌套调用计入所属顶层调用，不重复计数） */
+  let roundToolCalls = 0;
+  /** 本轮顶层工具调用失败次数 */
+  let roundToolErrors = 0;
+  /** 本轮顶层工具累计执行耗时（毫秒）；宿主未记录耗时的调用不计入 */
+  let roundToolMs = 0;
+  /** 上一轮调用了工具但全部失败：独立于「零工具调用的停滞」 */
+  let lastRoundAllFailed = false;
   /** 本轮迭代指令是否已注入：决定是否评估停滞 */
   let tickInjected = false;
   // 点火去重：三道点火机制可能同时命中，以下标志保证同一时刻只有一次点火
@@ -89,6 +97,11 @@ export default function piLoop(pi: ExtensionAPI): void {
   let watchdog: ReturnType<typeof setInterval> | undefined;
 
   const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** 把毫秒格式化成状态栏用的短时长。 */
+  function formatDuration(ms: number): string {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
 
   function isTick(message: unknown): boolean {
     const candidate = message as { role?: string; customType?: string } | undefined;
@@ -112,13 +125,20 @@ export default function piLoop(pi: ExtensionAPI): void {
       ctx.ui.setStatus(STATUS_KEY, label + theme.fg("warning", " 收尾中…"));
       return;
     }
+    let activity = "";
+    if (roundToolCalls > 0) {
+      activity = ` · 工具 ${roundToolCalls} 次`;
+      if (roundToolErrors > 0) activity += ` ${roundToolErrors} 失败`;
+      if (roundToolMs >= 1000) activity += ` ${formatDuration(roundToolMs)}`;
+    }
     const flags =
       (restartArmed ? theme.fg("accent", " ↻") : "") +
-      (stallStreak > 0 ? theme.fg("warning", " ⚠") : "");
-    ctx.ui.setStatus(STATUS_KEY, label + flags);
+      (stallStreak > 0 ? theme.fg("warning", " ⚠") : "") +
+      (lastRoundAllFailed ? theme.fg("error", " ✗") : "");
+    ctx.ui.setStatus(STATUS_KEY, label + theme.fg("dim", activity) + flags);
   }
 
-  function buildTickContent(outcome: TickOutcome): string {
+  function buildTickContent(outcome: TickOutcome, prevAllFailed: boolean): string {
     const lines = [
       `[PI-LOOP ACTIVE] 第 ${iteration} 轮自我迭代：这是一个不会自行停止的外部循环。`,
       "",
@@ -133,6 +153,9 @@ export default function piLoop(pi: ExtensionAPI): void {
     if (stallStreak > 0) {
       lines.push("", `⚠ 最近连续 ${stallStreak} 轮没有工具调用，本轮必须执行真实动作。`);
     }
+    if (prevAllFailed) {
+      lines.push("", "⚠ 上一轮工具调用全部失败：先查看错误输出定位原因，修复后再继续推进目标。");
+    }
     if (outcome === "error") {
       lines.push("", "⚠ 上一轮模型请求出错：先诊断原因并规避该错误，再继续推进目标。");
     }
@@ -146,16 +169,22 @@ export default function piLoop(pi: ExtensionAPI): void {
   function beginRound(outcome: TickOutcome, evaluateStall: boolean): TickMessage {
     iteration += 1;
     restartArmed = false;
+    // 全失败与零调用是两种不同情况：前者不动 stallStreak，只单独提示
+    const prevAllFailed = evaluateStall && roundToolCalls > 0 && roundToolErrors === roundToolCalls;
     if (evaluateStall) {
       if (usedToolThisRound) stallStreak = 0;
       else stallStreak += 1;
     }
+    lastRoundAllFailed = prevAllFailed;
     usedToolThisRound = false;
+    roundToolCalls = 0;
+    roundToolErrors = 0;
+    roundToolMs = 0;
     tickInjected = true;
     persist();
     return {
       customType: TICK_TYPE,
-      content: buildTickContent(outcome),
+      content: buildTickContent(outcome, prevAllFailed),
       display: true,
       details: { iteration, goal, stallStreak },
     };
@@ -238,6 +267,10 @@ export default function piLoop(pi: ExtensionAPI): void {
         cancelRestart();
         stallStreak = 0;
         usedToolThisRound = false;
+        roundToolCalls = 0;
+        roundToolErrors = 0;
+        roundToolMs = 0;
+        lastRoundAllFailed = false;
         tickInjected = false;
       }
       updateStatus(ctx);
@@ -311,8 +344,19 @@ export default function piLoop(pi: ExtensionAPI): void {
   });
 
   // 本轮是否真的调用过工具（纯文字回复不算迭代）
-  pi.on("tool_execution_start", async () => {
+  pi.on("tool_execution_start", async (event) => {
     usedToolThisRound = true;
+    // 嵌套调用（codemode 等工具内部发起）的耗时已含在其顶层调用中，不重复统计
+    if (!event.parentToolCallId) roundToolCalls += 1;
+  });
+
+  // 记录顶层工具的执行结果：只用于状态栏与下一轮提示，不参与 stallStreak 判定，
+  // 因为调试时运行失败的测试或构建同样是有效动作
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (event.parentToolCallId) return;
+    if (typeof event.durationMs === "number") roundToolMs += event.durationMs;
+    if (event.isError) roundToolErrors += 1;
+    if (phase !== "off") updateStatus(ctx);
   });
 
   pi.on("session_compact", async () => {
