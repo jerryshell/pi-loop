@@ -19,11 +19,11 @@
     "check": "npm run typecheck && npm run lint && npm run format:check"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.1.0",
-    "@earendil-works/pi-tui": "^1.1.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@earendil-works/pi-tui": "^1.2.0",
     "@types/node": "^26.6.5",
     "oxfmt": "^0.71.0",
-    "oxlint": "^1.87.0",
+    "oxlint": "^1.88.0",
     "typescript": "^7.0.2"
   },
   "peerDependencies": {
