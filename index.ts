@@ -7,7 +7,8 @@
  *   /loop-off-now   立即停止：中止当前运行并清除循环状态
  *
  * 设计契约（修改前先读 README 的「关键认知」）：
- *   - 停止条件只有 /loop-off 与 /loop-off-now；模型自述、报错、中断都不算
+ *   - 停止条件默认只有 /loop-off 与 /loop-off-now；模型自述、报错、中断都不算
+ *   - 唯一例外是上下文超限：重试只会让上下文更长，改为压缩恢复；恢复失败即停止
  *   - 四道点火机制：agent_before_settle、agent_settled、看门狗、session_start 恢复
  *   - 上下文只追加、不改写历史（前缀缓存友好）；压缩后清理旧指令，循环关闭后全部移除
  *   - 循环状态用 pi.appendEntry 写入会话；进程内变量只是缓存
@@ -31,8 +32,29 @@ const RESTART_MAX_DELAY_MS = 30_000;
 const SESSION_RESUME_DELAY_MS = 1_500;
 const WATCHDOG_INTERVAL_MS = 15_000;
 
+/** 上下文超限的错误文本特征：命中即不再盲目重试，改写为压缩恢复 */
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /context[_ ]length[_ ]exceeded/i,
+  /(?:longer|greater) than the (?:model['’]?s |maximum )?context length/i,
+  /exceed(?:s|ed)? (?:the )?(?:model['’]?s )?(?:maximum )?(?:context|prompt) (?:length|window)/i,
+  /maximum (?:context|prompt) length is \d+/i,
+  /(?:input|prompt|request|messages?) (?:is |are )?too (?:long|large)/i,
+  /reduce the length of the messages/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+];
+
+/** 命中即排除：限流与配额类错误不是上下文超限，退避重试即可 */
+const NON_OVERFLOW_PATTERNS = [
+  /rate limit/i,
+  /too many requests/i,
+  /throttl/i,
+  /quota/i,
+  /billing/i,
+];
+
 type LoopPhase = "off" | "running" | "stopping";
-type TickOutcome = "completed" | "aborted" | "error" | "interrupted" | undefined;
+type TickOutcome = "completed" | "aborted" | "error" | "interrupted" | "overflow" | undefined;
 
 interface PersistedState {
   phase: LoopPhase;
@@ -81,6 +103,14 @@ export default function piLoop(pi: ExtensionAPI): void {
   let roundToolMs = 0;
   /** 上一轮调用了工具但全部失败：独立于「零工具调用的停滞」 */
   let lastRoundAllFailed = false;
+  /** 最近一次模型请求的错误文本：结算事件只带 outcome，识别上下文超限需要原文 */
+  let lastErrorText = "";
+  /** 连续上下文超限次数：压缩成功后再次超限说明恢复无效，直接停止 */
+  let overflowErrorStreak = 0;
+  /** 已请求压缩恢复，等待 agent_settled 执行；期间禁止一切重新点火 */
+  let overflowRecoveryPending = false;
+  /** 压缩恢复代号：停止、重新激活、恢复会话时递增，使旧压缩回调失效 */
+  let overflowRecoveryToken = 0;
   /** 本轮迭代指令是否已注入：决定是否评估停滞 */
   let tickInjected = false;
   // 点火去重：三道点火机制可能同时命中，以下标志保证同一时刻只有一次点火
@@ -101,6 +131,24 @@ export default function piLoop(pi: ExtensionAPI): void {
   /** 把毫秒格式化成状态栏用的短时长。 */
   function formatDuration(ms: number): string {
     return `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  /** 判断错误文本是否为上下文超限：这类错误重试无法解决。 */
+  function isContextOverflowError(text: string): boolean {
+    if (text === "" || NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text))) return false;
+    return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+  }
+
+  /** 取错误文本首行并限长，用于通知与停止原因。 */
+  function summarizeError(text: string): string {
+    const line = text.split("\n")[0]?.trim() ?? "";
+    return line.length > 120 ? `${line.slice(0, 120)}…` : line || "未知错误";
+  }
+
+  /** 使进行中的压缩恢复回调失效。 */
+  function invalidateOverflowRecovery(): void {
+    overflowRecoveryToken += 1;
+    overflowRecoveryPending = false;
   }
 
   function isTick(message: unknown): boolean {
@@ -161,6 +209,12 @@ export default function piLoop(pi: ExtensionAPI): void {
     }
     if (outcome === "interrupted") {
       lines.push("", "⚠ 上一轮被外部中断（循环并未关闭）：从中断处继续，不等待确认。");
+    }
+    if (outcome === "overflow") {
+      lines.push(
+        "",
+        "⚠ 上一轮因上下文超限中断：会话已自动压缩，直接从中断处继续，不重复已完成的工作。",
+      );
     }
     return lines.join("\n");
   }
@@ -230,9 +284,54 @@ export default function piLoop(pi: ExtensionAPI): void {
   function stopLoop(ctx: ExtensionContext, reason: string): void {
     phase = "off";
     cancelRestart();
+    invalidateOverflowRecovery();
     updateStatus(ctx);
     persist();
     ctx.ui.notify(`pi-loop 已停止（完成 ${iteration} 轮）：${reason}`, "info");
+  }
+
+  /**
+   * 上下文超限恢复：压缩会话，成功即续跑，失败则停止循环。
+   * 超限时重试只会把上下文越堆越长，因此这里不再注入迭代指令、也不做退避。
+   */
+  function startOverflowRecovery(ctx: ExtensionContext): void {
+    const token = ++overflowRecoveryToken;
+    overflowRecoveryPending = true;
+    runActive = true;
+    updateStatus(ctx);
+    ctx.ui.notify("pi-loop：上下文超限，正在压缩会话后自动继续…", "warning");
+    try {
+      ctx.compact({
+        onComplete: () => {
+          if (token !== overflowRecoveryToken) return;
+          overflowRecoveryPending = false;
+          runActive = false;
+          if (disposed || phase === "off") return;
+          if (phase === "stopping") {
+            stopLoop(ctx, "上下文超限恢复完成");
+            return;
+          }
+          fireRestart(ctx, "overflow", RESTART_MIN_DELAY_MS);
+        },
+        onError: (error) => {
+          if (token !== overflowRecoveryToken) return;
+          overflowRecoveryPending = false;
+          runActive = false;
+          if (disposed || phase !== "running") return;
+          stopLoop(ctx, `上下文超限且压缩失败：${summarizeError(error.message)}`);
+        },
+      });
+    } catch (error) {
+      // 压缩无法启动时不能把 pending 留在原处：看门狗会让位，循环将永远停摆
+      if (token !== overflowRecoveryToken) return;
+      overflowRecoveryPending = false;
+      runActive = false;
+      if (disposed || phase !== "running") return;
+      stopLoop(
+        ctx,
+        `上下文超限且压缩无法启动：${summarizeError(error instanceof Error ? error.message : String(error))}`,
+      );
+    }
   }
 
   // [终端显示] 把冗长的迭代指令折叠成一行
@@ -265,6 +364,9 @@ export default function piLoop(pi: ExtensionAPI): void {
       errorBackoffMs = 0;
       if (!wasRunning) {
         cancelRestart();
+        invalidateOverflowRecovery();
+        overflowErrorStreak = 0;
+        lastErrorText = "";
         stallStreak = 0;
         usedToolThisRound = false;
         roundToolCalls = 0;
@@ -328,6 +430,7 @@ export default function piLoop(pi: ExtensionAPI): void {
       const streaming = !ctx.isIdle();
       phase = "off";
       cancelRestart();
+      invalidateOverflowRecovery();
       updateStatus(ctx);
       persist();
       if (streaming) ctx.abort();
@@ -361,6 +464,12 @@ export default function piLoop(pi: ExtensionAPI): void {
 
   pi.on("session_compact", async () => {
     trimTicksAfterCompact = true;
+  });
+
+  // 记录最近一次模型请求的错误文本：agent_before_settle 只带 outcome，识别上下文超限需要原文
+  pi.on("message_end", async (event) => {
+    if (event.message.role !== "assistant") return;
+    lastErrorText = event.message.stopReason === "error" ? (event.message.errorMessage ?? "") : "";
   });
 
   // 上下文只追加、不改写历史：删除任意一条历史消息都会让其后缀的前缀缓存全部失效
@@ -400,6 +509,20 @@ export default function piLoop(pi: ExtensionAPI): void {
     }
 
     if (event.outcome === "error") {
+      // 上下文超限：重试只会让上下文更长。不注入迭代指令，等 agent_settled 触发压缩恢复。
+      if (isContextOverflowError(lastErrorText)) {
+        errorBackoffMs = 0;
+        // 恢复还没开始的重复超限不重复计数：让本次结算照常触发已排队的压缩
+        if (!overflowRecoveryPending) overflowErrorStreak += 1;
+        if (overflowErrorStreak > 1) {
+          stopLoop(ctx, `上下文超限且压缩后仍未恢复：${summarizeError(lastErrorText)}`);
+          return;
+        }
+        overflowRecoveryPending = true;
+        runActive = true;
+        updateStatus(ctx);
+        return;
+      }
       errorBackoffMs =
         errorBackoffMs === 0
           ? ERROR_BACKOFF_START_MS
@@ -408,6 +531,9 @@ export default function piLoop(pi: ExtensionAPI): void {
       if (phase !== "running") return; // 退避期间被 /loop-off-now 停止
     } else {
       errorBackoffMs = 0;
+      // 有轮次正常完成：说明上下文不再超限，允许下一次超限重新压缩
+      overflowErrorStreak = 0;
+      overflowRecoveryPending = false;
     }
 
     const tick = beginRound(event.outcome === "error" ? "error" : undefined, tickInjected);
@@ -422,7 +548,18 @@ export default function piLoop(pi: ExtensionAPI): void {
   // 运行彻底结束而循环仍激活（被中断、异常结束、边界无法继续）：自动重新点火
   pi.on("agent_settled", async (_event, ctx) => {
     runActive = false;
-    if (disposed || phase !== "running") return;
+    if (disposed) return;
+    if (phase === "stopping") {
+      // 运行期间执行了 /loop-off：这是最后一个结算点，在这里收尾
+      stopLoop(ctx, "当前轮结束");
+      return;
+    }
+    if (phase !== "running") return;
+    if (overflowRecoveryPending) {
+      // 上一步已判定上下文超限：先压缩再续跑，压缩期间禁止其他点火
+      startOverflowRecovery(ctx);
+      return;
+    }
     const delay = restartDelayMs <= 0 ? RESTART_MIN_DELAY_MS : restartDelayMs;
     restartDelayMs = Math.min(Math.max(delay * 2, RESTART_MIN_DELAY_MS), RESTART_MAX_DELAY_MS);
     fireRestart(ctx, "interrupted", delay);
@@ -450,7 +587,8 @@ export default function piLoop(pi: ExtensionAPI): void {
 
     if (watchdog !== undefined) clearInterval(watchdog);
     watchdog = setInterval(() => {
-      if (disposed || phase !== "running" || runActive || restartArmed) return;
+      if (disposed || phase !== "running" || runActive || restartArmed || overflowRecoveryPending)
+        return;
       fireRestart(ctx, "interrupted", 0);
     }, WATCHDOG_INTERVAL_MS);
   });
@@ -458,6 +596,7 @@ export default function piLoop(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     disposed = true;
     cancelRestart();
+    invalidateOverflowRecovery();
     if (watchdog !== undefined) {
       clearInterval(watchdog);
       watchdog = undefined;
