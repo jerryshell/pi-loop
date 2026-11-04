@@ -9,15 +9,17 @@
  * 设计契约（修改前先读 README 的「关键认知」）：
  *   - 停止条件默认只有 /loop-off 与 /loop-off-now；模型自述、报错、中断都不算
  *   - 唯一例外是上下文超限：重试只会让上下文更长，改为压缩恢复；恢复失败即停止
+ *   - 超限判定复用宿主 isContextOverflow，宿主已放弃恢复时不再重复压缩
  *   - 四道点火机制：agent_before_settle、agent_settled、看门狗、session_start 恢复
  *   - 上下文只追加、不改写历史（前缀缓存友好）；压缩后清理旧指令，循环关闭后全部移除
  *   - 循环状态用 pi.appendEntry 写入会话；进程内变量只是缓存
- *   - 仅依赖宿主提供包，保持单文件、无构建步骤
+ *   - 仅依赖宿主提供包（pi-coding-agent / pi-tui / pi-ai），保持单文件、无构建步骤
  *
  * 激活状态通过 ctx.ui.setStatus 显示在底部状态栏。
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type AssistantMessage, isContextOverflow } from "@earendil-works/pi-ai";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 const STATUS_KEY = "pi-loop";
@@ -32,19 +34,16 @@ const RESTART_MAX_DELAY_MS = 30_000;
 const SESSION_RESUME_DELAY_MS = 1_500;
 const WATCHDOG_INTERVAL_MS = 15_000;
 
-/** 上下文超限的错误文本特征：命中即不再盲目重试，改写为压缩恢复 */
-const CONTEXT_OVERFLOW_PATTERNS = [
-  /context[_ ]length[_ ]exceeded/i,
-  /(?:longer|greater) than the (?:model['’]?s |maximum )?context length/i,
-  /exceed(?:s|ed)? (?:the )?(?:model['’]?s )?(?:maximum )?(?:context|prompt) (?:length|window)/i,
-  /maximum (?:context|prompt) length is \d+/i,
-  /(?:input|prompt|request|messages?) (?:is |are )?too (?:long|large)/i,
-  /reduce the length of the messages/i,
-  /too many tokens/i,
-  /token limit exceeded/i,
-];
+/** 状态栏上下文占用阈值（%）：低于 SHOW 不显示，达到 WARN 变黄，达到 ERROR 变红 */
+const CONTEXT_SHOW_PERCENT = 50;
+const CONTEXT_WARN_PERCENT = 80;
+const CONTEXT_ERROR_PERCENT = 92;
 
-/** 命中即排除：限流与配额类错误不是上下文超限，退避重试即可 */
+/**
+ * 命中即排除：限流与配额类错误不是上下文超限，退避重试即可。
+ * 超限特征本身来自宿主的 isContextOverflow：那里维护了所有服务商的正则，
+ * 本地不再复制，升级宿主即可继承新的服务商文案。
+ */
 const NON_OVERFLOW_PATTERNS = [
   /rate limit/i,
   /too many requests/i,
@@ -103,8 +102,15 @@ export default function piLoop(pi: ExtensionAPI): void {
   let roundToolMs = 0;
   /** 上一轮调用了工具但全部失败：独立于「零工具调用的停滞」 */
   let lastRoundAllFailed = false;
-  /** 最近一次模型请求的错误文本：结算事件只带 outcome，识别上下文超限需要原文 */
-  let lastErrorText = "";
+  /** 最近一次失败的模型响应：结算事件只带 outcome，超限判定需要整条消息 */
+  let lastError: AssistantMessage | undefined;
+  /** 上下文占用百分比：getContextUsage 会重建会话投影，只在必要时刷新 */
+  let contextPercent: number | null = null;
+  /** 本次会话累计花费（美元），costIsEstimate 为真表示含目录估算，不是供应商账单 */
+  let totalCost = 0;
+  let costIsEstimate = false;
+  /** 宿主 overflow 恢复失败的原因：说明宿主本轮已放弃，本地不再重复压缩 */
+  let hostOverflowFailure: string | undefined;
   /** 连续上下文超限次数：压缩成功后再次超限说明恢复无效，直接停止 */
   let overflowErrorStreak = 0;
   /** 已请求压缩恢复，等待 agent_settled 执行；期间禁止一切重新点火 */
@@ -133,16 +139,36 @@ export default function piLoop(pi: ExtensionAPI): void {
     return `${(ms / 1000).toFixed(1)}s`;
   }
 
-  /** 判断错误文本是否为上下文超限：这类错误重试无法解决。 */
-  function isContextOverflowError(text: string): boolean {
-    if (text === "" || NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text))) return false;
-    return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+  /** 判断错误消息是否为上下文超限：特征库用宿主的，本地只额外排除限流与配额类错误。 */
+  function isOverflowError(ctx: ExtensionContext, message: AssistantMessage | undefined): boolean {
+    if (!message) return false;
+    const text = message.errorMessage ?? "";
+    if (NON_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text))) return false;
+    // 传 contextWindow 才能识别静默溢出：供应商不报错，但用量已越过窗口
+    return isContextOverflow(message, ctx.model?.contextWindow);
   }
 
   /** 取错误文本首行并限长，用于通知与停止原因。 */
   function summarizeError(text: string): string {
     const line = text.split("\n")[0]?.trim() ?? "";
     return line.length > 120 ? `${line.slice(0, 120)}…` : line || "未知错误";
+  }
+
+  /** 刷新上下文占用：getContextUsage 会重建会话投影，只在轮次开始、消息结束、压缩后调用。 */
+  function refreshContextUsage(ctx: ExtensionContext): void {
+    try {
+      contextPercent = ctx.getContextUsage()?.percent ?? null;
+    } catch {
+      contextPercent = null;
+    }
+  }
+
+  /** 累计花费：任一响应缺 totalFromProvider 就标为估算，与宿主「全部来自供应商才算真实」一致。 */
+  function addCost(usage: AssistantMessage["usage"]): void {
+    const total = usage?.cost?.total;
+    if (typeof total !== "number" || !Number.isFinite(total)) return;
+    totalCost += total;
+    if (usage.cost.totalFromProvider !== true) costIsEstimate = true;
   }
 
   /** 使进行中的压缩恢复回调失效。 */
@@ -173,17 +199,32 @@ export default function piLoop(pi: ExtensionAPI): void {
       ctx.ui.setStatus(STATUS_KEY, label + theme.fg("warning", " 收尾中…"));
       return;
     }
-    let activity = "";
-    if (roundToolCalls > 0) {
-      activity = ` · 工具 ${roundToolCalls} 次`;
-      if (roundToolErrors > 0) activity += ` ${roundToolErrors} 失败`;
-      if (roundToolMs >= 1000) activity += ` ${formatDuration(roundToolMs)}`;
+    const segments: string[] = [];
+    if (contextPercent !== null && contextPercent >= CONTEXT_SHOW_PERCENT) {
+      const color =
+        contextPercent >= CONTEXT_ERROR_PERCENT
+          ? "error"
+          : contextPercent >= CONTEXT_WARN_PERCENT
+            ? "warning"
+            : "dim";
+      segments.push(theme.fg(color, `ctx ${Math.round(contextPercent)}%`));
     }
+    if (roundToolCalls > 0) {
+      let tools = `工具 ${roundToolCalls} 次`;
+      if (roundToolErrors > 0) tools += ` ${roundToolErrors} 失败`;
+      if (roundToolMs >= 1000) tools += ` ${formatDuration(roundToolMs)}`;
+      segments.push(theme.fg("dim", tools));
+    }
+    if (totalCost > 0) {
+      const amount = totalCost < 0.1 ? totalCost.toFixed(3) : totalCost.toFixed(2);
+      segments.push(theme.fg("dim", `${costIsEstimate ? "~" : ""}$${amount}`));
+    }
+    const activity = segments.length > 0 ? ` · ${segments.join(theme.fg("dim", " · "))}` : "";
     const flags =
       (restartArmed ? theme.fg("accent", " ↻") : "") +
       (stallStreak > 0 ? theme.fg("warning", " ⚠") : "") +
       (lastRoundAllFailed ? theme.fg("error", " ✗") : "");
-    ctx.ui.setStatus(STATUS_KEY, label + theme.fg("dim", activity) + flags);
+    ctx.ui.setStatus(STATUS_KEY, label + activity + flags);
   }
 
   function buildTickContent(outcome: TickOutcome, prevAllFailed: boolean): string {
@@ -220,9 +261,16 @@ export default function piLoop(pi: ExtensionAPI): void {
   }
 
   /** 开始新一轮：推进计数、更新停滞统计，并返回本轮注入内容。 */
-  function beginRound(outcome: TickOutcome, evaluateStall: boolean): TickMessage {
+  function beginRound(
+    ctx: ExtensionContext,
+    outcome: TickOutcome,
+    evaluateStall: boolean,
+  ): TickMessage {
     iteration += 1;
     restartArmed = false;
+    // 新的一轮开始前，上下文一定被重新请求过：刷新占用并清除上一轮的宿主压缩失败标记
+    refreshContextUsage(ctx);
+    hostOverflowFailure = undefined;
     // 全失败与零调用是两种不同情况：前者不动 stallStreak，只单独提示
     const prevAllFailed = evaluateStall && roundToolCalls > 0 && roundToolErrors === roundToolCalls;
     if (evaluateStall) {
@@ -274,7 +322,7 @@ export default function piLoop(pi: ExtensionAPI): void {
         updateStatus(ctx);
         return;
       }
-      const tick = beginRound(outcome, false);
+      const tick = beginRound(ctx, outcome, false);
       runActive = true;
       updateStatus(ctx);
       pi.sendMessage(tick, { triggerTurn: true });
@@ -366,7 +414,8 @@ export default function piLoop(pi: ExtensionAPI): void {
         cancelRestart();
         invalidateOverflowRecovery();
         overflowErrorStreak = 0;
-        lastErrorText = "";
+        lastError = undefined;
+        hostOverflowFailure = undefined;
         stallStreak = 0;
         usedToolThisRound = false;
         roundToolCalls = 0;
@@ -387,7 +436,7 @@ export default function piLoop(pi: ExtensionAPI): void {
       }
 
       if (ctx.isIdle()) {
-        const tick = beginRound(undefined, false);
+        const tick = beginRound(ctx, undefined, false);
         runActive = true;
         updateStatus(ctx);
         pi.sendMessage(tick, { triggerTurn: true });
@@ -462,14 +511,32 @@ export default function piLoop(pi: ExtensionAPI): void {
     if (phase !== "off") updateStatus(ctx);
   });
 
-  pi.on("session_compact", async () => {
+  // 宿主的压缩事件带 reason 与 willRetry：用它区分「阈值压缩」「宿主自己的超限恢复」与本地发起的压缩
+  pi.on("session_compact", async (event, ctx) => {
     trimTicksAfterCompact = true;
+    refreshContextUsage(ctx);
+    if (event.reason === "overflow" && !overflowRecoveryPending) {
+      const retried = event.willRetry ? "并重试本轮" : "";
+      ctx.ui.notify(`pi-loop：宿主已自动压缩上下文${retried}`, "info");
+    }
+    if (phase !== "off") updateStatus(ctx);
   });
 
-  // 记录最近一次模型请求的错误文本：agent_before_settle 只带 outcome，识别上下文超限需要原文
-  pi.on("message_end", async (event) => {
+  // 宿主自己的超限恢复失败：本轮已经压缩过且放弃了，本地再压缩一次只会重复失败
+  pi.on("session_compact_failed", async (event, ctx) => {
+    if (event.reason !== "overflow" || event.aborted) return;
+    if (overflowRecoveryPending) return; // 本地发起的压缩由 startOverflowRecovery 的 onError 处理
+    hostOverflowFailure = event.errorMessage ?? "宿主压缩失败";
+    if (phase !== "off") updateStatus(ctx);
+  });
+
+  // 记录最近一次失败的模型响应（超限判定需要整条消息），并累计花费与上下文占用
+  pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
-    lastErrorText = event.message.stopReason === "error" ? (event.message.errorMessage ?? "") : "";
+    lastError = event.message.stopReason === "error" ? event.message : undefined;
+    addCost(event.message.usage);
+    refreshContextUsage(ctx);
+    if (phase !== "off") updateStatus(ctx);
   });
 
   // 上下文只追加、不改写历史：删除任意一条历史消息都会让其后缀的前缀缓存全部失效
@@ -510,12 +577,20 @@ export default function piLoop(pi: ExtensionAPI): void {
 
     if (event.outcome === "error") {
       // 上下文超限：重试只会让上下文更长。不注入迭代指令，等 agent_settled 触发压缩恢复。
-      if (isContextOverflowError(lastErrorText)) {
+      if (isOverflowError(ctx, lastError)) {
         errorBackoffMs = 0;
+        // 宿主本轮已经压缩过且失败：再压缩只会重复失败，带上宿主的失败原因直接停止
+        if (hostOverflowFailure !== undefined) {
+          stopLoop(ctx, `上下文超限且压缩失败：${summarizeError(hostOverflowFailure)}`);
+          return;
+        }
         // 恢复还没开始的重复超限不重复计数：让本次结算照常触发已排队的压缩
         if (!overflowRecoveryPending) overflowErrorStreak += 1;
         if (overflowErrorStreak > 1) {
-          stopLoop(ctx, `上下文超限且压缩后仍未恢复：${summarizeError(lastErrorText)}`);
+          stopLoop(
+            ctx,
+            `上下文超限且压缩后仍未恢复：${summarizeError(lastError?.errorMessage ?? "")}`,
+          );
           return;
         }
         overflowRecoveryPending = true;
@@ -534,9 +609,10 @@ export default function piLoop(pi: ExtensionAPI): void {
       // 有轮次正常完成：说明上下文不再超限，允许下一次超限重新压缩
       overflowErrorStreak = 0;
       overflowRecoveryPending = false;
+      hostOverflowFailure = undefined;
     }
 
-    const tick = beginRound(event.outcome === "error" ? "error" : undefined, tickInjected);
+    const tick = beginRound(ctx, event.outcome === "error" ? "error" : undefined, tickInjected);
     runActive = true;
     updateStatus(ctx);
     return {
@@ -577,6 +653,18 @@ export default function piLoop(pi: ExtensionAPI): void {
       iteration = typeof state?.iteration === "number" ? state.iteration : 0;
       break;
     }
+
+    // 会话可能换了：重置运行期缓存，并用历史中的助手响应回填累计花费
+    lastError = undefined;
+    hostOverflowFailure = undefined;
+    totalCost = 0;
+    costIsEstimate = false;
+    for (const entry of entries) {
+      if (entry.type !== "message") continue;
+      const message = entry.message as { role?: string; usage?: AssistantMessage["usage"] };
+      if (message?.role === "assistant" && message.usage) addCost(message.usage);
+    }
+    refreshContextUsage(ctx);
 
     updateStatus(ctx);
     if (phase === "running") {
