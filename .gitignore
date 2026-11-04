@@ -1,1 +1,3 @@
 node_modules/
+# 包管理统一用 bun，只提交 bun.lock：npm 会重新生成这份锁文件，不提交
+package-lock.json

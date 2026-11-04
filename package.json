@@ -1,6 +1,6 @@
 {
   "name": "pi-loop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi 扩展：激活后无限自我迭代",
   "keywords": [
     "pi-package"
@@ -10,6 +10,10 @@
     "type": "git",
     "url": "git+https://github.com/jerryshell/pi-loop.git"
   },
+  "files": [
+    "index.ts",
+    "CHANGELOG.md"
+  ],
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -19,20 +23,24 @@
     "check": "npm run typecheck && npm run lint && npm run format:check"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.2.0",
-    "@earendil-works/pi-tui": "^1.2.0",
-    "@types/node": "^26.6.5",
-    "oxfmt": "^0.71.0",
-    "oxlint": "^1.88.0",
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@earendil-works/pi-tui": "^1.5.0",
+    "@types/node": "^26.6.6",
+    "oxfmt": "^0.76.0",
+    "oxlint": "^1.91.0",
     "typescript": "^7.0.2"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
+  "packageManager": "bun@1.4.4",
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "changelogPath": "./CHANGELOG.md"
   }
 }
